@@ -475,19 +475,32 @@ def pubchem_by_name(name: str):
     except Exception:
         return None
 
-@st.cache_data(show_spinner=False, ttl=300)
 def pubchem_by_smiles(smiles: str):
+    """POST first; fall back to GET if POST fails. No cache — button handler uses session_state."""
+    # Method 1: POST (handles brackets, @, # in SMILES)
     try:
         r = requests.post(
             f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/property/{PC}/JSON",
             data={"smiles": smiles},
             timeout=15, headers=_HEADERS,
         )
-        if not r.ok:
-            return None
-        return r.json()["PropertyTable"]["Properties"][0]
+        if r.ok:
+            return r.json()["PropertyTable"]["Properties"][0]
     except Exception:
-        return None
+        pass
+    # Method 2: GET with URL-encoded SMILES
+    try:
+        encoded = urllib.parse.quote(smiles, safe="")
+        r2 = requests.get(
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/"
+            f"{encoded}/property/{PC}/JSON",
+            timeout=15, headers=_HEADERS,
+        )
+        if r2.ok:
+            return r2.json()["PropertyTable"]["Properties"][0]
+    except Exception:
+        pass
+    return None
 
 @st.cache_data(show_spinner=False, ttl=300)
 def pubchem_synonyms(cid: int):
@@ -502,20 +515,38 @@ def pubchem_synonyms(cid: int):
     except Exception:
         return []
 
-@st.cache_data(show_spinner=False, ttl=300)
-def chembl_by_inchikey(ik: str):
-    try:
-        r = requests.get(
-            f"https://www.ebi.ac.uk/chembl/api/data/molecule"
-            f"?molecule_structures__standard_inchi_key={ik}&format=json&limit=1",
-            timeout=15, headers=_HEADERS,
-        )
-        if not r.ok:
-            return None
-        mols = r.json().get("molecules", [])
-        return mols[0] if mols else None
-    except Exception:
-        return None
+def chembl_by_inchikey(ik: str, name_hint: str = ""):
+    """Search ChEMBL by InChIKey, with name-based fallback. No cache — session_state managed."""
+    # Method 1: InChIKey (most precise)
+    if ik:
+        try:
+            r = requests.get(
+                f"https://www.ebi.ac.uk/chembl/api/data/molecule"
+                f"?molecule_structures__standard_inchi_key={ik}&format=json&limit=1",
+                timeout=15, headers=_HEADERS,
+            )
+            if r.ok:
+                mols = r.json().get("molecules", [])
+                if mols:
+                    return mols[0]
+        except Exception:
+            pass
+    # Method 2: preferred name (fallback when InChIKey fails or is absent)
+    if name_hint and name_hint not in ("Custom Compound", "—"):
+        try:
+            r2 = requests.get(
+                f"https://www.ebi.ac.uk/chembl/api/data/molecule"
+                f"?pref_name__iexact={urllib.parse.quote(name_hint, safe='')}"
+                f"&format=json&limit=1",
+                timeout=15, headers=_HEADERS,
+            )
+            if r2.ok:
+                mols = r2.json().get("molecules", [])
+                if mols:
+                    return mols[0]
+        except Exception:
+            pass
+    return None
 
 @st.cache_data(show_spinner=False, ttl=600)
 def pubmed_search(query: str, max_results: int = 5):
@@ -1830,22 +1861,31 @@ with tab_db:
 
     if st.button("🔍 Fetch database records", type="primary"):
         if _allowed("db"):
-            # PubChem
-            with st.spinner("Querying PubChem via SMILES…"):
+            # ── Step 1: PubChem ───────────────────────────────────────────────
+            pc = None
+            pc_method = ""
+            with st.spinner("Querying PubChem via SMILES (POST + GET fallback)…"):
                 pc = pubchem_by_smiles(smiles_input.strip())
-            st.session_state["_db_pc"] = pc
+                pc_method = "SMILES"
 
-            # ChEMBL
-            ik = pc.get("InChIKey") if pc else None
-            if ik:
-                with st.spinner("Querying ChEMBL via InChIKey…"):
-                    chembl = chembl_by_inchikey(ik)
-                st.session_state["_db_chembl"] = chembl
-            else:
-                st.session_state["_db_chembl"] = None
+            # Auto-fallback: try name search if SMILES failed
+            if pc is None and compound_name != "Custom Compound":
+                with st.spinner(f"SMILES lookup failed — retrying by name '{compound_name}'…"):
+                    pc = pubchem_by_name(compound_name)
+                    pc_method = f"name '{compound_name}'"
 
-            # PubMed
-            search_q = pc.get("IUPACName", compound_name) if pc else compound_name
+            st.session_state["_db_pc"]        = pc
+            st.session_state["_db_pc_method"] = pc_method if pc else "all methods failed"
+
+            # ── Step 2: ChEMBL ────────────────────────────────────────────────
+            ik        = pc.get("InChIKey") if pc else None
+            name_hint = pc.get("IUPACName", compound_name) if pc else compound_name
+            with st.spinner("Querying ChEMBL (InChIKey + name fallback)…"):
+                chembl = chembl_by_inchikey(ik, name_hint)
+            st.session_state["_db_chembl"] = chembl
+
+            # ── Step 3: PubMed ────────────────────────────────────────────────
+            search_q = (pc.get("IUPACName", compound_name) if pc else compound_name)
             if search_q and search_q != "Custom Compound":
                 with st.spinner(f"Searching PubMed for '{search_q[:40]}'…"):
                     articles = pubmed_search(search_q + " drug")
@@ -1878,13 +1918,31 @@ with tab_db:
                     st.markdown("**Synonyms / trade names:**")
                     for s in syns[:6]: st.markdown(f"  - {s}")
         else:
-            st.warning("⚠️ No PubChem match found for this SMILES. "
-                       "The compound may be novel, or your SMILES may differ from the canonical form. "
-                       "Try the sidebar name search for common drugs.")
-            with st.expander("Debug info"):
-                st.code(f"SMILES sent: {smiles_input.strip()}\n"
-                        "Endpoint: POST https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/property/.../JSON\n"
-                        "If this is a known drug, try looking it up by name in the sidebar first.")
+            method_tried = st.session_state.get("_db_pc_method", "unknown")
+            st.warning(
+                f"⚠️ PubChem returned no match ({method_tried}). "
+                "This is normal for novel or custom molecules not yet registered in PubChem."
+            )
+            with st.expander("🔍 Diagnostic info"):
+                st.markdown("**What was tried:**")
+                st.markdown(
+                    f"1. **SMILES POST** → `POST /compound/smiles/property/…/JSON`  \n"
+                    f"   Body: `smiles={smiles_input.strip()}`\n\n"
+                    f"2. **SMILES GET** → `GET /compound/smiles/{{url-encoded}}/property/…/JSON`\n\n"
+                    f"3. **Name fallback** → `GET /compound/name/{compound_name}/property/…/JSON`"
+                )
+                st.markdown("**Common reasons for failure:**")
+                st.markdown(
+                    "- Compound not registered in PubChem (novel molecule ✓ expected)\n"
+                    "- SMILES has unusual ring notation that PubChem can't parse\n"
+                    "- Transient network timeout on Streamlit Cloud — click the button again\n"
+                    "- Non-standard isotope labels or charges in SMILES"
+                )
+                st.markdown("**Try this:**")
+                st.markdown(
+                    "Type the drug name in the **sidebar name search** (e.g. 'aspirin') — "
+                    "this uses a different API endpoint and is more reliable for known drugs."
+                )
 
         st.divider()
 
@@ -1908,10 +1966,12 @@ with tab_db:
                 if props.get("alogp"):
                     st.markdown(f"**ALogP:** {props['alogp']}")
         elif chembl is None and pc:
-            st.info("No ChEMBL record found for this InChIKey. "
-                    "The compound may be a research tool not yet in ChEMBL, or still in early development.")
+            st.info("No ChEMBL record found via InChIKey or name. "
+                    "The compound may be a research tool not yet in ChEMBL, or still in preclinical development.")
         elif chembl is None and not pc:
-            st.info("ChEMBL lookup skipped — PubChem lookup needed first to obtain InChIKey.")
+            st.info("ChEMBL lookup attempted but PubChem also returned no data — "
+                    "both InChIKey and name searches were tried. "
+                    "If this is a known drug, use the sidebar name search first.")
 
         st.divider()
 
