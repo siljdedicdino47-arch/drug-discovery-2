@@ -461,45 +461,115 @@ def run_batch(df: pd.DataFrame) -> pd.DataFrame:
 PC = "MolecularFormula,MolecularWeight,IUPACName,CanonicalSMILES,IsomericSMILES,InChIKey,CID"
 _HEADERS = {"User-Agent": "DrugDiscoveryDashboard/5.0 (research)"}
 
-@st.cache_data(show_spinner=False, ttl=300)
 def pubchem_by_name(name: str):
+    """Name → CID first, then properties by CID. No @st.cache_data to avoid stale None."""
     try:
+        # Step 1: resolve name → CID (lightweight endpoint)
         encoded = urllib.parse.quote(name.strip(), safe="")
         r = requests.get(
-            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded}/property/{PC}/JSON",
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded}/cids/JSON",
             timeout=15, headers=_HEADERS,
         )
         if not r.ok:
             return None
-        return r.json()["PropertyTable"]["Properties"][0]
+        cids = r.json().get("IdentifierList", {}).get("CID", [])
+        if not cids:
+            return None
+        # Step 2: properties by CID
+        r2 = requests.get(
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cids[0]}/property/{PC}/JSON",
+            timeout=15, headers=_HEADERS,
+        )
+        if not r2.ok:
+            return None
+        return r2.json()["PropertyTable"]["Properties"][0]
     except Exception:
         return None
 
-def pubchem_by_smiles(smiles: str):
-    """POST first; fall back to GET if POST fails. No cache — button handler uses session_state."""
-    # Method 1: POST (handles brackets, @, # in SMILES)
+
+def pubchem_lookup(smiles: str, name: str = "", inchikey: str = "") -> dict | None:
+    """
+    Try 5 PubChem methods in order until one succeeds.
+    No @st.cache_data — caller stores result in st.session_state.
+    """
+    base = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound"
+
+    def _props_by_cid(cid):
+        try:
+            r = requests.get(f"{base}/cid/{cid}/property/{PC}/JSON",
+                             timeout=15, headers=_HEADERS)
+            if r.ok:
+                return r.json()["PropertyTable"]["Properties"][0]
+        except Exception:
+            pass
+        return None
+
+    # 1. SMILES POST → CID, then properties
     try:
-        r = requests.post(
-            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/property/{PC}/JSON",
-            data={"smiles": smiles},
-            timeout=15, headers=_HEADERS,
-        )
+        r = requests.post(f"{base}/smiles/cids/JSON",
+                          data={"smiles": smiles}, timeout=15, headers=_HEADERS)
         if r.ok:
-            return r.json()["PropertyTable"]["Properties"][0]
+            cids = r.json().get("IdentifierList", {}).get("CID", [])
+            if cids:
+                result = _props_by_cid(cids[0])
+                if result:
+                    return result
     except Exception:
         pass
-    # Method 2: GET with URL-encoded SMILES
+
+    # 2. SMILES GET (URL-encoded) → CID, then properties
     try:
-        encoded = urllib.parse.quote(smiles, safe="")
-        r2 = requests.get(
-            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/"
-            f"{encoded}/property/{PC}/JSON",
-            timeout=15, headers=_HEADERS,
-        )
-        if r2.ok:
-            return r2.json()["PropertyTable"]["Properties"][0]
+        enc_smi = urllib.parse.quote(smiles, safe="")
+        r = requests.get(f"{base}/smiles/{enc_smi}/cids/JSON",
+                         timeout=15, headers=_HEADERS)
+        if r.ok:
+            cids = r.json().get("IdentifierList", {}).get("CID", [])
+            if cids:
+                result = _props_by_cid(cids[0])
+                if result:
+                    return result
     except Exception:
         pass
+
+    # 3. InChIKey → CID, then properties (InChIKey computed locally from RDKit)
+    if inchikey:
+        try:
+            r = requests.get(f"{base}/inchikey/{inchikey}/cids/JSON",
+                             timeout=15, headers=_HEADERS)
+            if r.ok:
+                cids = r.json().get("IdentifierList", {}).get("CID", [])
+                if cids:
+                    result = _props_by_cid(cids[0])
+                    if result:
+                        return result
+        except Exception:
+            pass
+
+    # 4. Name → CID, then properties
+    if name and name != "Custom Compound":
+        try:
+            enc_name = urllib.parse.quote(name.strip(), safe="")
+            r = requests.get(f"{base}/name/{enc_name}/cids/JSON",
+                             timeout=15, headers=_HEADERS)
+            if r.ok:
+                cids = r.json().get("IdentifierList", {}).get("CID", [])
+                if cids:
+                    result = _props_by_cid(cids[0])
+                    if result:
+                        return result
+        except Exception:
+            pass
+
+    # 5. Direct property fetch by InChIKey (bypasses CID step)
+    if inchikey:
+        try:
+            r = requests.get(f"{base}/inchikey/{inchikey}/property/{PC}/JSON",
+                             timeout=15, headers=_HEADERS)
+            if r.ok:
+                return r.json()["PropertyTable"]["Properties"][0]
+        except Exception:
+            pass
+
     return None
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -1028,7 +1098,7 @@ with st.sidebar:
         if name_q.strip():
             if _allowed("sidebar"):
                 with st.spinner("Querying PubChem…"):
-                    pc_res = pubchem_by_name(name_q.strip())
+                    pc_res = pubchem_lookup(smiles="", name=name_q.strip())
                 if pc_res:
                     st.session_state.smiles_override = (pc_res.get("IsomericSMILES")
                                                         or pc_res.get("CanonicalSMILES",""))
@@ -1112,6 +1182,15 @@ data = predict_admet(smiles_input.strip())
 if "error" in data: st.error(data["error"]); st.stop()
 
 sc = synthetic_complexity(mol)
+
+# Compute InChIKey locally — used for database lookups without depending on PubChem
+mol_inchikey = None
+try:
+    _inchi = Chem.MolToInchi(mol)
+    if _inchi:
+        mol_inchikey = Chem.InchiToInchiKey(_inchi)
+except Exception:
+    pass
 
 if st.session_state.lookup_name:
     compound_name = st.session_state.lookup_name
@@ -1861,27 +1940,22 @@ with tab_db:
 
     if st.button("🔍 Fetch database records", type="primary"):
         if _allowed("db"):
-            # ── Step 1: PubChem ───────────────────────────────────────────────
-            pc = None
-            pc_method = ""
-            with st.spinner("Querying PubChem via SMILES (POST + GET fallback)…"):
-                pc = pubchem_by_smiles(smiles_input.strip())
-                pc_method = "SMILES"
-
-            # Auto-fallback: try name search if SMILES failed
-            if pc is None and compound_name != "Custom Compound":
-                with st.spinner(f"SMILES lookup failed — retrying by name '{compound_name}'…"):
-                    pc = pubchem_by_name(compound_name)
-                    pc_method = f"name '{compound_name}'"
-
+            # ── Step 1: PubChem (5 methods, local InChIKey included) ──────────
+            with st.spinner("Querying PubChem (5 methods: SMILES POST/GET, InChIKey, name, direct)…"):
+                pc = pubchem_lookup(
+                    smiles    = smiles_input.strip(),
+                    name      = compound_name,
+                    inchikey  = mol_inchikey or "",
+                )
             st.session_state["_db_pc"]        = pc
-            st.session_state["_db_pc_method"] = pc_method if pc else "all methods failed"
+            st.session_state["_db_pc_method"] = "succeeded" if pc else "all 5 methods failed"
 
-            # ── Step 2: ChEMBL ────────────────────────────────────────────────
-            ik        = pc.get("InChIKey") if pc else None
-            name_hint = pc.get("IUPACName", compound_name) if pc else compound_name
+            # ── Step 2: ChEMBL — uses locally computed InChIKey, independent of PubChem ──
+            # mol_inchikey is computed from RDKit so ChEMBL never depends on PubChem succeeding
+            ik_for_chembl   = mol_inchikey or (pc.get("InChIKey") if pc else None)
+            name_for_chembl = (pc.get("IUPACName", compound_name) if pc else compound_name)
             with st.spinner("Querying ChEMBL (InChIKey + name fallback)…"):
-                chembl = chembl_by_inchikey(ik, name_hint)
+                chembl = chembl_by_inchikey(ik_for_chembl, name_for_chembl)
             st.session_state["_db_chembl"] = chembl
 
             # ── Step 3: PubMed ────────────────────────────────────────────────
@@ -1918,30 +1992,30 @@ with tab_db:
                     st.markdown("**Synonyms / trade names:**")
                     for s in syns[:6]: st.markdown(f"  - {s}")
         else:
-            method_tried = st.session_state.get("_db_pc_method", "unknown")
-            st.warning(
-                f"⚠️ PubChem returned no match ({method_tried}). "
-                "This is normal for novel or custom molecules not yet registered in PubChem."
-            )
+            st.warning("⚠️ PubChem API did not return data after 5 lookup methods.")
+
+            # Always offer a direct PubChem link using the locally-computed InChIKey
+            if mol_inchikey:
+                st.markdown(
+                    f"**Open on PubChem directly** (using your molecule's InChIKey computed by RDKit):  \n"
+                    f"[🔗 https://pubchem.ncbi.nlm.nih.gov/compound/{mol_inchikey}]"
+                    f"(https://pubchem.ncbi.nlm.nih.gov/compound/{mol_inchikey})"
+                )
+
             with st.expander("🔍 Diagnostic info"):
-                st.markdown("**What was tried:**")
+                st.markdown(f"**InChIKey (local, from RDKit):** `{mol_inchikey or 'unavailable'}`")
+                st.markdown("**5 methods attempted:**")
                 st.markdown(
-                    f"1. **SMILES POST** → `POST /compound/smiles/property/…/JSON`  \n"
-                    f"   Body: `smiles={smiles_input.strip()}`\n\n"
-                    f"2. **SMILES GET** → `GET /compound/smiles/{{url-encoded}}/property/…/JSON`\n\n"
-                    f"3. **Name fallback** → `GET /compound/name/{compound_name}/property/…/JSON`"
+                    f"1. SMILES POST → `/compound/smiles/cids/JSON` → then `/compound/cid/…/property/…`  \n"
+                    f"2. SMILES GET (URL-encoded) → same two-step  \n"
+                    f"3. InChIKey GET → `/compound/inchikey/{mol_inchikey or '…'}/cids/JSON` → property  \n"
+                    f"4. Name GET → `/compound/name/{compound_name}/cids/JSON` → property  \n"
+                    f"5. InChIKey direct → `/compound/inchikey/{mol_inchikey or '…'}/property/…`"
                 )
-                st.markdown("**Common reasons for failure:**")
                 st.markdown(
-                    "- Compound not registered in PubChem (novel molecule ✓ expected)\n"
-                    "- SMILES has unusual ring notation that PubChem can't parse\n"
-                    "- Transient network timeout on Streamlit Cloud — click the button again\n"
-                    "- Non-standard isotope labels or charges in SMILES"
-                )
-                st.markdown("**Try this:**")
-                st.markdown(
-                    "Type the drug name in the **sidebar name search** (e.g. 'aspirin') — "
-                    "this uses a different API endpoint and is more reliable for known drugs."
+                    "**Most likely cause:** PubChem's REST API occasionally rate-limits or times out "
+                    "requests from Streamlit Cloud's shared IP ranges. Click the button again in 30 seconds, "
+                    "or use the direct link above to view the compound on PubChem's website."
                 )
 
         st.divider()
