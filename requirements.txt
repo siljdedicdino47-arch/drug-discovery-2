@@ -2,3 +2,7 @@ streamlit>=1.35.0
 rdkit>=2023.9.5
 Pillow>=10.0.0
 pandas>=2.0.0
+requests>=2.31.0
+py3Dmol>=2.0.0
+reportlab>=4.0.0
+plotly>=5.18.0
