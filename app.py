@@ -20,6 +20,8 @@ try:
     from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
     from rdkit.Chem.Scaffolds import MurckoScaffold
     from rdkit.Chem.MolStandardize import rdMolStandardize
+    from rdkit.Chem.EnumerateStereoisomers import (
+        EnumerateStereoisomers, StereoEnumerationOptions)
     from PIL import Image
     RDKIT_OK = True
 except ImportError:
@@ -230,6 +232,21 @@ def enumerate_tautomers(mol, max_t: int = 8):
         return [(Chem.MolToSmiles(t), t) for t in tauts], Chem.MolToSmiles(canon)
     except Exception:
         return [], None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stereoisomer enumeration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def enumerate_stereoisomers(mol, max_isomers: int = 16) -> list:
+    """Return list of (smiles, mol) for all unique stereoisomers."""
+    try:
+        opts = StereoEnumerationOptions(unique=True, onlyUnassigned=False,
+                                        maxIsomers=max_isomers)
+        isomers = list(EnumerateStereoisomers(mol, options=opts))
+        return [(Chem.MolToSmiles(iso, isomericSmiles=True), iso) for iso in isomers]
+    except Exception:
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -540,6 +557,185 @@ def pubmed_search(query: str, max_results: int = 5):
         return arts
     except Exception:
         return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PubChem GHS / Safety data
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False, ttl=600)
+def pubchem_ghs(cid: int):
+    """Fetch GHS classification and experimental physical properties from PubChem PUG View."""
+    try:
+        r = requests.get(
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/{cid}/JSON"
+            f"?heading=Safety+and+Hazards",
+            timeout=15, headers=_HEADERS,
+        )
+        if not r.ok:
+            return None
+
+        def _find(node, heading):
+            out = []
+            if isinstance(node, dict):
+                if node.get("TOCHeading") == heading:
+                    out.append(node)
+                for v in node.values():
+                    out.extend(_find(v, heading))
+            elif isinstance(node, list):
+                for item in node:
+                    out.extend(_find(item, heading))
+            return out
+
+        def _strings(section):
+            return [swm.get("String","")
+                    for info in section.get("Information",[])
+                    for swm  in info.get("Value",{}).get("StringWithMarkup",[])
+                    if swm.get("String","")]
+
+        record   = r.json().get("Record", {})
+        hazards  = []
+        precauts = []
+        signal   = None
+        pictograms = []
+
+        for sec in _find(record, "GHS Classification"):
+            for sub in sec.get("Section", []):
+                h = sub.get("TOCHeading","")
+                if "Hazard Statement"   in h: hazards.extend(_strings(sub))
+                elif "Precautionary"   in h: precauts.extend(_strings(sub))
+                elif "Signal"          in h:
+                    s = _strings(sub)
+                    if s: signal = s[0]
+                elif "Pictogram"       in h: pictograms.extend(_strings(sub))
+
+        # Experimental physical properties
+        phys = {}
+        prop_map = {
+            "Boiling Point": "boiling_point",  "Melting Point":  "melting_point",
+            "Flash Point":   "flash_point",    "Solubility":     "solubility",
+            "Density":       "density",        "Vapor Pressure": "vapor_pressure",
+            "LogP":          "logp_exp",       "pKa":            "pka",
+        }
+        for sec in _find(record, "Experimental Properties"):
+            for sub in sec.get("Section", []):
+                key = prop_map.get(sub.get("TOCHeading",""))
+                if key:
+                    vals = _strings(sub)
+                    if vals:
+                        phys[key] = vals[0]
+
+        return {
+            "signal":      signal,
+            "hazards":     hazards[:12],
+            "precautions": precauts[:12],
+            "pictograms":  pictograms[:8],
+            "phys":        phys,
+        }
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Computed MSDS safety profile (structure-based, no API needed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_msds_profile(mol, data: dict, tox_hits: list) -> dict:
+    logp = data["logP"]; mw = data["molecular_weight"]
+    tpsa = data["tpsa"]; hbd = data["h_bond_donors"]
+    rb   = data["rotatable_bonds"]
+
+    high_tox = [h for h in tox_hits if h["severity"] == "high"]
+    mod_tox  = [h for h in tox_hits if h["severity"] == "moderate"]
+
+    # GHS hazard statement estimates
+    ghs_h = []
+    signal = "Warning"
+
+    if high_tox:
+        ghs_h.append("H301 Toxic if swallowed [structural estimate]")
+        ghs_h.append("H311 Toxic in contact with skin [structural estimate]")
+        signal = "Danger"
+    elif mod_tox:
+        ghs_h.append("H302 Harmful if swallowed [structural estimate]")
+
+    if hbd >= 2 and tpsa > 60:
+        ghs_h.append("H315 Causes skin irritation [structural estimate]")
+        ghs_h.append("H319 Causes serious eye irritation [structural estimate]")
+
+    if any(h["label"] in ("Nitroaromatic","Aromatic amine") for h in tox_hits):
+        ghs_h.append("H351 Suspected of causing cancer [structural alert]")
+        signal = "Danger"
+
+    if any(h["label"] == "Hydrazine" for h in tox_hits):
+        ghs_h.append("H341 Suspected of causing genetic defects [structural alert]")
+        signal = "Danger"
+
+    if logp > 4:
+        ghs_h.append("H411 Toxic to aquatic life with long lasting effects")
+    elif logp > 2:
+        ghs_h.append("H412 Harmful to aquatic life with long lasting effects")
+
+    if not ghs_h:
+        ghs_h.append("No specific GHS hazard classification estimated from structure")
+
+    # PPE
+    ppe = ["Safety spectacles or goggles", "Lab coat", "Nitrile gloves (0.1 mm min)"]
+    if signal == "Danger" or high_tox:
+        ppe += ["Chemical-resistant gloves", "Work in certified fume hood",
+                "Consider supplied-air respirator if generating aerosols"]
+    if logp < -1 and mw < 200:
+        ppe.append("Respiratory protection — small, hydrophilic molecules can be inhaled")
+
+    # Storage
+    storage = [
+        "Store in a cool (≤25°C), dry, well-ventilated area away from direct sunlight",
+        "Keep container tightly sealed — use amber glass for light-sensitive compounds",
+        "Segregate from oxidisers, strong acids, and strong bases",
+    ]
+    if any(h["label"] == "Peroxide" for h in tox_hits):
+        storage.append("⚠️ Peroxide-forming compound — inspect for peroxide formation before use")
+    if logp > 4:
+        storage.append("High logP — avoid prolonged contact with plastic containers; use glass")
+
+    # First aid
+    first_aid = {
+        "Skin contact":  "Remove contaminated clothing. Wash with soap and water for ≥15 min. "
+                         "Seek medical attention if irritation persists.",
+        "Eye contact":   "Flush with water for ≥15 min, holding eyelids open. "
+                         "Seek immediate medical attention.",
+        "Ingestion":     "Do NOT induce vomiting. Rinse mouth with water. "
+                         "Seek immediate medical attention. Show SDS to physician.",
+        "Inhalation":    "Move to fresh air immediately. If breathing is difficult, give oxygen. "
+                         "Seek medical attention if symptoms persist.",
+    }
+
+    # Physical property estimates (computed)
+    formula = Chem.rdMolDescriptors.CalcMolFormula(mol)
+    ha      = mol.GetNumHeavyAtoms()
+    env_risk = "High" if logp > 4 else "Moderate" if logp > 2 else "Low"
+
+    # Estimated volatility (very rough — small, nonpolar = more volatile)
+    if mw < 150 and logp > 1:
+        volatility = "Potentially volatile — handle in fume hood"
+    elif mw < 250 and logp > 2:
+        volatility = "Low-to-moderate volatility"
+    else:
+        volatility = "Low volatility expected (MW and logP suggest low vapour pressure)"
+
+    return {
+        "signal":        signal,
+        "ghs_hazards":   ghs_h,
+        "ppe":           ppe,
+        "storage":       storage,
+        "first_aid":     first_aid,
+        "env_risk":      env_risk,
+        "formula":       formula,
+        "volatility":    volatility,
+        "heavy_atoms":   ha,
+        "note": ("⚠️ Structure-based estimates only. Always consult the official supplier SDS "
+                 "before handling any chemical in a laboratory setting."),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -856,7 +1052,8 @@ with st.sidebar:
     st.markdown("**Tabs**")
     st.markdown("💊 Drug-likeness · 🔬 ADMET · ☠️ Toxicity\n\n"
                 "⚡ Covalent · 🧊 3D · 🔗 Similar · 🔄 Repurposing\n\n"
-                "🧬 Stereo & Tautomers · 📊 Compare · 📦 Batch · 🔍 Databases")
+                "🧬 Stereo & Tautomers · 🧪 MSDS & Safety\n\n"
+                "📊 Compare · 📦 Batch · 🔍 Databases")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -946,10 +1143,10 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 
 (tab_dl, tab_admet, tab_tox, tab_cov, tab_3d, tab_sim,
- tab_rep, tab_stereo, tab_cmp, tab_batch, tab_db) = st.tabs([
+ tab_rep, tab_stereo, tab_msds, tab_cmp, tab_batch, tab_db) = st.tabs([
     "💊 Drug-likeness","🔬 ADMET","☠️ Toxicity","⚡ Covalent",
     "🧊 3D Structure","🔗 Similar Drugs","🔄 Repurposing",
-    "🧬 Stereo & Tautomers","📊 Compare","📦 Batch","🔍 Databases"
+    "🧬 Stereo & Tautomers","🧪 MSDS & Safety","📊 Compare","📦 Batch","🔍 Databases"
 ])
 
 
@@ -1273,75 +1470,256 @@ with tab_rep:
 # ═══ TAB 8 — Stereo & Tautomers ══════════════════════════════════════════════
 with tab_stereo:
     st.subheader("🧬 Stereochemistry & Tautomers")
-    s1, s2 = st.columns(2)
+    st.markdown('<p class="cite">R/S assignment: CIP rules (Cahn, Ingold & Prelog 1966) · '
+                'Stereoisomer enumeration: RDKit EnumerateStereoisomers · '
+                'Tautomers: RDKit MolStandardize (Sayle 2010)</p>', unsafe_allow_html=True)
 
-    with s1:
-        st.markdown("#### Stereochemistry Analysis")
-        _xp("Chirality matters enormously in drug development. "
-            "Thalidomide's R-enantiomer is sedative; its S-enantiomer is teratogenic. "
-            "Undefined stereocenters are a red flag for regulatory submissions.")
-        stereo_res = analyze_stereo(mol)
+    stereo_res = analyze_stereo(mol)
 
-        if not stereo_res["is_chiral"]:
-            st.success("✅ Achiral molecule — no stereocenters or stereospecific double bonds.")
-            _xp("The molecule is identical to its mirror image. No stereochemical concerns for synthesis or regulatory filings.")
+    # ── Stereochemistry overview ───────────────────────────────────────────────
+    st.markdown("#### Stereochemistry")
+    _xp("Chirality is critical in drug development. Thalidomide's R-enantiomer is sedative; "
+        "its S-enantiomer is teratogenic. Undefined stereocenters are a regulatory red flag — "
+        "the FDA requires specification of absolute configuration in INDs and NDAs.")
+
+    if not stereo_res["is_chiral"]:
+        st.success("✅ Achiral molecule — no stereocenters or stereospecific double bonds.")
+        _xp("Identical to its mirror image (superimposable). "
+            "No enantiomer separation needed; a single synthesis route yields one compound.")
+    else:
+        km1, km2, km3, km4 = st.columns(4)
+        km1.metric("Total centers",    stereo_res["total"])
+        km2.metric("Defined (R/S)",    len(stereo_res["defined"]),
+                   help="Absolute configuration assigned")
+        km3.metric("Undefined ⚠️",     len(stereo_res["undefined"]),
+                   help="Configuration not yet specified — creates multiple isomers")
+        km4.metric("Possible isomers", stereo_res["max_isomers"],
+                   help="2ⁿ where n = undefined centers")
+
+        # R/S table
+        if stereo_res["defined"]:
+            st.markdown("**Defined stereocenters (R/S):**")
+            rows_rs = []
+            for idx, config in stereo_res["defined"]:
+                atom = mol.GetAtomWithIdx(idx)
+                rows_rs.append({
+                    "Atom index": idx,
+                    "Element":    atom.GetSymbol(),
+                    "Configuration": config,
+                    "Meaning": ("Right-handed (clockwise CIP priority order)"
+                                if config == "R" else
+                                "Left-handed (counter-clockwise CIP priority order)"),
+                })
+            st.dataframe(pd.DataFrame(rows_rs), use_container_width=True, hide_index=True)
+
+        if stereo_res["undefined"]:
+            st.markdown(_b(f"⚠️ {len(stereo_res['undefined'])} undefined stereocenters","warn"),
+                        unsafe_allow_html=True)
+            _xp(f"**{stereo_res['max_isomers']} possible stereoisomers** arise from the undefined centers. "
+                "Each may have a completely different pharmacological profile. "
+                "Assign absolute configuration via X-ray crystallography or chiral HPLC-CD before advancing.")
+
+        if stereo_res["db_stereo"]:
+            st.markdown("**Double bond geometry (E/Z):**")
+            for bond_idx, config in stereo_res["db_stereo"]:
+                meaning = ("E = substituents on opposite sides (trans-like)"
+                           if config == "E" else
+                           "Z = substituents on same side (cis-like)")
+                st.markdown(f"  - Bond {bond_idx}: **{config}** — {meaning}")
+
+    # ── Enumerate all stereoisomers ────────────────────────────────────────────
+    if stereo_res["is_chiral"]:
+        st.markdown("#### All Stereoisomers")
+        _xp("RDKit EnumerateStereoisomers generates every possible stereoisomer by permuting "
+            "all undefined (and defined) chiral centers. Structures capped at 16.")
+
+        all_isomers = enumerate_stereoisomers(mol, max_isomers=16)
+        input_smi   = Chem.MolToSmiles(mol, isomericSmiles=True)
+
+        if not all_isomers:
+            st.info("Stereoisomer enumeration returned no results.")
         else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total centers", stereo_res["total"])
-            c2.metric("Defined", len(stereo_res["defined"]))
-            c3.metric("Undefined ⚠️", len(stereo_res["undefined"]))
+            st.success(f"**{len(all_isomers)} stereoisomer(s) enumerated** "
+                       f"(theoretical max: {stereo_res['max_isomers']})")
 
-            if stereo_res["defined"]:
-                st.markdown("**Defined stereocenters:**")
-                for idx, config in stereo_res["defined"]:
-                    atom = mol.GetAtomWithIdx(idx)
-                    st.markdown(f"  - Atom {idx} ({atom.GetSymbol()}): **{config}**-configuration")
+            cols_per_row = 3
+            for row_start in range(0, len(all_isomers), cols_per_row):
+                row_cols = st.columns(cols_per_row)
+                for col_i, (smi, iso_mol) in enumerate(
+                        all_isomers[row_start:row_start + cols_per_row]):
+                    with row_cols[col_i]:
+                        is_input = (smi == input_smi)
+                        label = f"Isomer {row_start + col_i + 1}"
+                        if is_input:
+                            label += " ★ (your input)"
+                        st.markdown(f"**{label}**")
+                        try:
+                            img_b = mol_to_png(iso_mol, w=260, h=190)
+                            st.image(Image.open(io.BytesIO(img_b)), use_container_width=True)
+                        except Exception:
+                            pass
+                        st.code(smi, language=None)
+                        # Show R/S assignments for this isomer
+                        iso_centers = Chem.FindMolChiralCenters(
+                            iso_mol, includeUnassigned=True)
+                        if iso_centers:
+                            rs_str = ", ".join(
+                                f"{sym}({c})" for _, c in iso_centers
+                                for sym in [iso_mol.GetAtomWithIdx(_).GetSymbol()])
+                            st.caption(f"Centers: {rs_str}")
+                        if is_input:
+                            st.success("★ This is your input structure")
 
-            if stereo_res["undefined"]:
-                st.markdown(_b(f"⚠️ {len(stereo_res['undefined'])} undefined stereocenters","warn"),
-                            unsafe_allow_html=True)
-                _xp(f"Undefined centers create up to **{stereo_res['max_isomers']} possible stereoisomers**. "
-                    "Specify absolute configuration before biological testing. "
-                    "Each stereoisomer can differ in potency, selectivity, metabolism, and toxicity.")
+    st.divider()
 
-            if stereo_res["db_stereo"]:
-                st.markdown("**Double bond stereochemistry (E/Z):**")
-                for bond_idx, config in stereo_res["db_stereo"]:
-                    st.markdown(f"  - Bond {bond_idx}: **{config}**-configuration")
+    # ── Tautomers ─────────────────────────────────────────────────────────────
+    st.markdown("#### Tautomer Enumeration")
+    _xp("Tautomers rapidly interconvert in solution by proton transfer. "
+        "The biologically active tautomer may differ from the form you drew. "
+        "Key example: keto vs. enol forms, or 1H vs. 3H imidazole tautomers.")
 
-            if stereo_res["max_isomers"] > 1:
-                st.warning(f"⚠️ Up to {stereo_res['max_isomers']} stereoisomers possible. "
-                           "Test individual enantiomers/diastereomers separately.")
+    tautomers, canon_smi = enumerate_tautomers(mol)
 
-    with s2:
-        st.markdown("#### Tautomer Enumeration")
-        _xp("Tautomers are constitutional isomers that rapidly interconvert by proton transfer. "
-            "The biologically active form may differ from the form you drew. "
-            "Canonical tautomer = the most stable form per Sayle's rules (2015).")
-        st.markdown('<p class="cite">Sayle, J. Chem. Inf. Model. 2010 · RDKit MolStandardize tautomer enumeration</p>',
-                    unsafe_allow_html=True)
+    if not tautomers:
+        st.info("Only one reasonable tautomeric form found.")
+    else:
+        st.markdown(f"**{len(tautomers)} tautomer(s) found** · "
+                    f"Canonical (most stable): `{canon_smi[:70] if canon_smi else '—'}`")
 
-        tautomers, canon_smi = enumerate_tautomers(mol)
-
-        if not tautomers:
-            st.info("No tautomers found, or this molecule has only one reasonable tautomeric form.")
-        else:
-            st.markdown(f"**{len(tautomers)} tautomer(s) found** (showing up to 8)")
-            if canon_smi:
-                st.markdown(f"**Canonical (most stable) tautomer:**")
-                st.code(canon_smi, language=None)
-
-            for i, (smi, tmol) in enumerate(tautomers[:8]):
+        t_cols = st.columns(min(len(tautomers), 3))
+        for i, (smi, tmol) in enumerate(tautomers[:6]):
+            with t_cols[i % 3]:
                 is_canon = (smi == canon_smi)
-                label = f"Tautomer {i+1}" + (" ★ canonical" if is_canon else "")
-                with st.expander(f"{label}: `{smi[:60]}{'...' if len(smi)>60 else ''}`"):
-                    try:
-                        t_img = mol_to_png(tmol, w=300, h=220)
-                        st.image(Image.open(io.BytesIO(t_img)), use_container_width=True)
-                    except Exception:
-                        st.code(smi)
-                    if is_canon:
-                        st.success("★ This is the canonical (most stable) tautomer")
+                badge = " ★ canonical" if is_canon else ""
+                st.markdown(f"**Tautomer {i+1}{badge}**")
+                try:
+                    t_img = mol_to_png(tmol, w=240, h=180)
+                    st.image(Image.open(io.BytesIO(t_img)), use_container_width=True)
+                except Exception:
+                    pass
+                st.code(smi[:60] + ("…" if len(smi) > 60 else ""), language=None)
+                if is_canon:
+                    st.caption("★ Most stable tautomer")
+
+
+# ═══ TAB 9 — MSDS & Safety ═══════════════════════════════════════════════════
+with tab_msds:
+    st.subheader("🧪 MSDS / Safety Data Sheet")
+    _xp("Structure-based safety profile computed by RDKit. "
+        "If you have already clicked <b>Fetch database records</b> in the Databases tab, "
+        "official GHS data from PubChem will also appear below. "
+        "<b>Always consult the supplier SDS before handling any chemical.</b>")
+
+    tox_hits_msds = detect_tox(mol)
+    msds = compute_msds_profile(mol, data, tox_hits_msds)
+
+    # ── Signal word + hazard banner ───────────────────────────────────────────
+    signal_color = "#dc2626" if msds["signal"] == "Danger" else "#d97706"
+    st.markdown(
+        f'<div style="background:{signal_color};color:#fff;padding:10px 18px;'
+        f'border-radius:8px;font-size:1.4rem;font-weight:800;margin-bottom:12px">'
+        f'⚠️ {msds["signal"].upper()}</div>',
+        unsafe_allow_html=True)
+    st.caption(msds["note"])
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        # Physical & chemical properties
+        st.markdown("#### Physical & Chemical Properties")
+        phys_rows = [
+            ("Molecular formula",  msds["formula"]),
+            ("Molecular weight",   f"{data['molecular_weight']} Da"),
+            ("Calculated logP",    f"{data['logP']} (Wildman-Crippen)"),
+            ("TPSA",               f"{data['tpsa']} Ų"),
+            ("H-bond donors",      str(data["h_bond_donors"])),
+            ("H-bond acceptors",   str(data["h_bond_acceptors"])),
+            ("Rotatable bonds",    str(data["rotatable_bonds"])),
+            ("Heavy atom count",   str(msds["heavy_atoms"])),
+            ("Est. solubility",    f"LogS = {data['estimated_solubility']['log_s']} "
+                                   f"({data['estimated_solubility']['category']})"),
+            ("Volatility estimate", msds["volatility"]),
+            ("Environmental risk", msds["env_risk"]),
+        ]
+        st.dataframe(pd.DataFrame(phys_rows, columns=["Property","Value"]),
+                     use_container_width=True, hide_index=True)
+
+        # GHS Hazard statements
+        st.markdown("#### GHS Hazard Statements (H-codes)")
+        _xp("H-codes are UN GHS hazard statements. Prefixed [structural estimate] = "
+            "computed from RDKit substructure analysis, not from experimental data.")
+        for h in msds["ghs_hazards"]:
+            severity_color = ("#f87171" if "Toxic" in h or "fatal" in h.lower()
+                              else "#facc15" if "Harmful" in h or "Suspected" in h
+                              else "#94a3b8")
+            st.markdown(
+                f'<div style="border-left:3px solid {severity_color};'
+                f'padding:4px 10px;margin:3px 0;font-size:0.87rem">{h}</div>',
+                unsafe_allow_html=True)
+
+    with col_right:
+        # First aid
+        st.markdown("#### First Aid Measures")
+        for route, action in msds["first_aid"].items():
+            with st.expander(f"🩺 {route}"):
+                st.markdown(action)
+
+        # PPE
+        st.markdown("#### Personal Protective Equipment")
+        for item in msds["ppe"]:
+            st.markdown(f"🛡️ {item}")
+
+        # Storage
+        st.markdown("#### Storage & Handling")
+        for tip in msds["storage"]:
+            st.markdown(f"📦 {tip}")
+
+        # Disposal
+        st.markdown("#### Disposal")
+        _xp("Dispose of contents and container in accordance with local/national regulations. "
+            "Do not pour down the drain. Contact a licensed hazardous waste disposal company. "
+            "Never dispose of unknown chemicals without expert guidance.")
+
+    # ── Official PubChem GHS (shown if CID is available from Databases tab) ───
+    st.divider()
+    st.markdown("#### Official GHS Data from PubChem")
+
+    pc_cached = st.session_state.get("_db_pc")
+    if pc_cached and pc_cached != "__not_fetched__" and pc_cached is not None:
+        cid_for_ghs = pc_cached.get("CID")
+        if cid_for_ghs:
+            if st.button("Load official GHS from PubChem", key="load_ghs"):
+                if _allowed("ghs"):
+                    with st.spinner("Fetching GHS data from PubChem…"):
+                        ghs = pubchem_ghs(int(cid_for_ghs))
+                    st.session_state["_ghs"] = ghs
+                else:
+                    st.warning("Rate limit reached. Wait 60 s.")
+
+            ghs = st.session_state.get("_ghs")
+            if ghs:
+                g1, g2 = st.columns(2)
+                with g1:
+                    if ghs.get("signal"):
+                        st.markdown(f"**Signal word:** `{ghs['signal']}`")
+                    if ghs.get("hazards"):
+                        st.markdown("**H-codes (official):**")
+                        for h in ghs["hazards"]:
+                            st.markdown(f"- {h}")
+                    if ghs.get("phys"):
+                        st.markdown("**Experimental properties:**")
+                        for k, v in ghs["phys"].items():
+                            st.markdown(f"- **{k.replace('_',' ').title()}:** {v}")
+                with g2:
+                    if ghs.get("precautions"):
+                        st.markdown("**P-codes (precautionary statements):**")
+                        for p in ghs["precautions"]:
+                            st.markdown(f"- {p}")
+            elif ghs is not None:
+                st.info("No GHS data found in PubChem for this compound's CID.")
+    else:
+        st.info("Go to the **🔍 Databases** tab and click **Fetch database records** first — "
+                "this unlocks the official PubChem GHS hazard classification.")
 
 
 # ═══ TAB 9 — Compare ═════════════════════════════════════════════════════════
