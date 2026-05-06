@@ -487,88 +487,121 @@ def pubchem_by_name(name: str):
         return None
 
 
-def pubchem_lookup(smiles: str, name: str = "", inchikey: str = "") -> dict | None:
+def pubchem_lookup(smiles: str, name: str = "", inchikey: str = "",
+                   _debug: list | None = None) -> dict | None:
     """
     Try 5 PubChem methods in order until one succeeds.
+    Pass a list as _debug to collect per-method status messages.
     No @st.cache_data — caller stores result in st.session_state.
     """
+    if _debug is None:
+        _debug = []
     base = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound"
 
     def _props_by_cid(cid):
         try:
-            r = requests.get(f"{base}/cid/{cid}/property/{PC}/JSON",
-                             timeout=15, headers=_HEADERS)
+            url = f"{base}/cid/{cid}/property/{PC}/JSON"
+            r = requests.get(url, timeout=15, headers=_HEADERS)
+            _debug.append(f"    props/cid/{cid}: HTTP {r.status_code}")
             if r.ok:
                 return r.json()["PropertyTable"]["Properties"][0]
-        except Exception:
-            pass
+            else:
+                _debug.append(f"    props response: {r.text[:120]}")
+        except Exception as e:
+            _debug.append(f"    props/cid/{cid} error: {type(e).__name__}: {e}")
         return None
 
     # 1. SMILES POST → CID, then properties
-    try:
-        r = requests.post(f"{base}/smiles/cids/JSON",
-                          data={"smiles": smiles}, timeout=15, headers=_HEADERS)
-        if r.ok:
-            cids = r.json().get("IdentifierList", {}).get("CID", [])
-            if cids:
-                result = _props_by_cid(cids[0])
-                if result:
-                    return result
-    except Exception:
-        pass
+    if smiles:
+        try:
+            r = requests.post(f"{base}/smiles/cids/JSON",
+                              data={"smiles": smiles}, timeout=15, headers=_HEADERS)
+            _debug.append(f"M1 SMILES POST cids: HTTP {r.status_code}")
+            if r.ok:
+                cids = r.json().get("IdentifierList", {}).get("CID", [])
+                _debug.append(f"    CIDs returned: {cids[:3]}")
+                if cids:
+                    result = _props_by_cid(cids[0])
+                    if result:
+                        _debug.append("    ✅ M1 succeeded")
+                        return result
+            else:
+                _debug.append(f"    response: {r.text[:120]}")
+        except Exception as e:
+            _debug.append(f"M1 SMILES POST error: {type(e).__name__}: {e}")
 
     # 2. SMILES GET (URL-encoded) → CID, then properties
-    try:
-        enc_smi = urllib.parse.quote(smiles, safe="")
-        r = requests.get(f"{base}/smiles/{enc_smi}/cids/JSON",
-                         timeout=15, headers=_HEADERS)
-        if r.ok:
-            cids = r.json().get("IdentifierList", {}).get("CID", [])
-            if cids:
-                result = _props_by_cid(cids[0])
-                if result:
-                    return result
-    except Exception:
-        pass
+    if smiles:
+        try:
+            enc_smi = urllib.parse.quote(smiles, safe="")
+            r = requests.get(f"{base}/smiles/{enc_smi}/cids/JSON",
+                             timeout=15, headers=_HEADERS)
+            _debug.append(f"M2 SMILES GET cids: HTTP {r.status_code}")
+            if r.ok:
+                cids = r.json().get("IdentifierList", {}).get("CID", [])
+                _debug.append(f"    CIDs returned: {cids[:3]}")
+                if cids:
+                    result = _props_by_cid(cids[0])
+                    if result:
+                        _debug.append("    ✅ M2 succeeded")
+                        return result
+            else:
+                _debug.append(f"    response: {r.text[:120]}")
+        except Exception as e:
+            _debug.append(f"M2 SMILES GET error: {type(e).__name__}: {e}")
 
-    # 3. InChIKey → CID, then properties (InChIKey computed locally from RDKit)
+    # 3. InChIKey → CID, then properties
     if inchikey:
         try:
             r = requests.get(f"{base}/inchikey/{inchikey}/cids/JSON",
                              timeout=15, headers=_HEADERS)
+            _debug.append(f"M3 InChIKey→CID: HTTP {r.status_code}")
             if r.ok:
                 cids = r.json().get("IdentifierList", {}).get("CID", [])
+                _debug.append(f"    CIDs returned: {cids[:3]}")
                 if cids:
                     result = _props_by_cid(cids[0])
                     if result:
+                        _debug.append("    ✅ M3 succeeded")
                         return result
-        except Exception:
-            pass
+            else:
+                _debug.append(f"    response: {r.text[:120]}")
+        except Exception as e:
+            _debug.append(f"M3 InChIKey error: {type(e).__name__}: {e}")
 
     # 4. Name → CID, then properties
-    if name and name != "Custom Compound":
+    if name and name not in ("Custom Compound", ""):
         try:
             enc_name = urllib.parse.quote(name.strip(), safe="")
             r = requests.get(f"{base}/name/{enc_name}/cids/JSON",
                              timeout=15, headers=_HEADERS)
+            _debug.append(f"M4 Name→CID ({name!r}): HTTP {r.status_code}")
             if r.ok:
                 cids = r.json().get("IdentifierList", {}).get("CID", [])
+                _debug.append(f"    CIDs returned: {cids[:3]}")
                 if cids:
                     result = _props_by_cid(cids[0])
                     if result:
+                        _debug.append("    ✅ M4 succeeded")
                         return result
-        except Exception:
-            pass
+            else:
+                _debug.append(f"    response: {r.text[:120]}")
+        except Exception as e:
+            _debug.append(f"M4 Name error: {type(e).__name__}: {e}")
 
-    # 5. Direct property fetch by InChIKey (bypasses CID step)
+    # 5. Direct property fetch by InChIKey (skips CID step)
     if inchikey:
         try:
             r = requests.get(f"{base}/inchikey/{inchikey}/property/{PC}/JSON",
                              timeout=15, headers=_HEADERS)
+            _debug.append(f"M5 InChIKey direct props: HTTP {r.status_code}")
             if r.ok:
+                _debug.append("    ✅ M5 succeeded")
                 return r.json()["PropertyTable"]["Properties"][0]
-        except Exception:
-            pass
+            else:
+                _debug.append(f"    response: {r.text[:120]}")
+        except Exception as e:
+            _debug.append(f"M5 InChIKey direct error: {type(e).__name__}: {e}")
 
     return None
 
@@ -1934,21 +1967,23 @@ with tab_db:
 
     # Clear cached results when SMILES changes
     if st.session_state.get("_db_smiles") != smiles_input.strip():
-        for k in ("_db_pc","_db_chembl","_db_pubmed"):
+        for k in ("_db_pc","_db_chembl","_db_pubmed","_db_pc_debug"):
             st.session_state.pop(k, None)
         st.session_state["_db_smiles"] = smiles_input.strip()
 
     if st.button("🔍 Fetch database records", type="primary"):
         if _allowed("db"):
             # ── Step 1: PubChem (5 methods, local InChIKey included) ──────────
+            _pc_debug: list = []
             with st.spinner("Querying PubChem (5 methods: SMILES POST/GET, InChIKey, name, direct)…"):
                 pc = pubchem_lookup(
                     smiles    = smiles_input.strip(),
                     name      = compound_name,
                     inchikey  = mol_inchikey or "",
+                    _debug    = _pc_debug,
                 )
-            st.session_state["_db_pc"]        = pc
-            st.session_state["_db_pc_method"] = "succeeded" if pc else "all 5 methods failed"
+            st.session_state["_db_pc"]       = pc
+            st.session_state["_db_pc_debug"] = _pc_debug
 
             # ── Step 2: ChEMBL — uses locally computed InChIKey, independent of PubChem ──
             # mol_inchikey is computed from RDKit so ChEMBL never depends on PubChem succeeding
@@ -1994,28 +2029,24 @@ with tab_db:
         else:
             st.warning("⚠️ PubChem API did not return data after 5 lookup methods.")
 
-            # Always offer a direct PubChem link using the locally-computed InChIKey
             if mol_inchikey:
                 st.markdown(
-                    f"**Open on PubChem directly** (using your molecule's InChIKey computed by RDKit):  \n"
-                    f"[🔗 https://pubchem.ncbi.nlm.nih.gov/compound/{mol_inchikey}]"
+                    f"**Open on PubChem directly** (InChIKey from RDKit):  \n"
+                    f"[🔗 pubchem.ncbi.nlm.nih.gov/compound/{mol_inchikey}]"
                     f"(https://pubchem.ncbi.nlm.nih.gov/compound/{mol_inchikey})"
                 )
 
-            with st.expander("🔍 Diagnostic info"):
-                st.markdown(f"**InChIKey (local, from RDKit):** `{mol_inchikey or 'unavailable'}`")
-                st.markdown("**5 methods attempted:**")
+            with st.expander("🔍 Diagnostic — exact errors per method"):
+                st.markdown(f"**InChIKey (RDKit):** `{mol_inchikey or 'unavailable'}`")
+                pc_debug = st.session_state.get("_db_pc_debug", [])
+                if pc_debug:
+                    st.code("\n".join(pc_debug), language=None)
+                else:
+                    st.info("No debug info captured — button not clicked yet in this session.")
                 st.markdown(
-                    f"1. SMILES POST → `/compound/smiles/cids/JSON` → then `/compound/cid/…/property/…`  \n"
-                    f"2. SMILES GET (URL-encoded) → same two-step  \n"
-                    f"3. InChIKey GET → `/compound/inchikey/{mol_inchikey or '…'}/cids/JSON` → property  \n"
-                    f"4. Name GET → `/compound/name/{compound_name}/cids/JSON` → property  \n"
-                    f"5. InChIKey direct → `/compound/inchikey/{mol_inchikey or '…'}/property/…`"
-                )
-                st.markdown(
-                    "**Most likely cause:** PubChem's REST API occasionally rate-limits or times out "
-                    "requests from Streamlit Cloud's shared IP ranges. Click the button again in 30 seconds, "
-                    "or use the direct link above to view the compound on PubChem's website."
+                    "**If you see HTTP 429**: PubChem is rate-limiting — wait 60 s and retry.  \n"
+                    "**If you see HTTP 503 / ConnectionError**: transient network issue — retry.  \n"
+                    "**If you see HTTP 404 on all methods**: compound not yet in PubChem database."
                 )
 
         st.divider()
