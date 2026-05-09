@@ -1553,7 +1553,7 @@ with tab_sim:
     if PLOTLY_OK:
         fig = similarity_network(mol, compound_name, DRUG_DB, threshold=thresh)
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="sim_network_tab6")
         else:
             st.info(f"No drugs with Tanimoto ≥ {thresh}. Try lowering the threshold.")
     else:
@@ -1607,7 +1607,7 @@ with tab_rep:
         st.markdown("#### Repurposing Landscape Network")
         fig = similarity_network(mol, compound_name, DRUG_DB, threshold=min_sim)
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="sim_network_tab7")
 
 
 # ═══ TAB 8 — Stereo & Tautomers ══════════════════════════════════════════════
