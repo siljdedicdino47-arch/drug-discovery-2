@@ -81,7 +81,7 @@ def predict_admet(smiles: str) -> dict:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return {"error": f"Invalid SMILES: {smiles}"}
-    mw   = Descriptors.ExactMolWt(mol);   logp = Descriptors.MolLogP(mol)
+    mw   = Descriptors.MolWt(mol);         logp = Descriptors.MolLogP(mol)
     hbd  = Lipinski.NumHDonors(mol);      hba  = Lipinski.NumHAcceptors(mol)
     tpsa = Descriptors.TPSA(mol);         rb   = Lipinski.NumRotatableBonds(mol)
     rings = rdMolDescriptors.CalcNumRings(mol)
@@ -460,6 +460,49 @@ def run_batch(df: pd.DataFrame) -> pd.DataFrame:
 
 PC = "MolecularFormula,MolecularWeight,IUPACName,CanonicalSMILES,IsomericSMILES,InChIKey,CID"
 _HEADERS = {"User-Agent": "DrugDiscoveryDashboard/5.0 (research)"}
+_CIR     = "https://cactus.nci.nih.gov/chemical/structure"
+
+
+# ── NIH Chemical Identifier Resolver (CIR) ────────────────────────────────────
+# Reliable fallback when PubChem PUG-REST is blocked/rate-limited on Cloud.
+
+@st.cache_data(show_spinner=False, ttl=600)
+def cir_smiles_from_name(name: str) -> str | None:
+    """Name → canonical SMILES via NIH CIR."""
+    try:
+        r = requests.get(f"{_CIR}/{urllib.parse.quote(name)}/smiles",
+                         timeout=10, headers=_HEADERS)
+        if r.ok and r.text.strip():
+            return r.text.strip().split("\n")[0]
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(show_spinner=False, ttl=600)
+def cir_iupac_from_smiles(smiles: str) -> str | None:
+    """SMILES → IUPAC name via NIH CIR (used to auto-name custom compounds)."""
+    try:
+        r = requests.get(f"{_CIR}/{urllib.parse.quote(smiles)}/iupac_name",
+                         timeout=10, headers=_HEADERS)
+        if r.ok and r.text.strip():
+            raw = r.text.strip().split("\n")[0]
+            return raw[:80] if raw else None          # truncate very long names
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(show_spinner=False, ttl=600)
+def cir_iupac_from_inchikey(ik: str) -> str | None:
+    """InChIKey → IUPAC name via NIH CIR."""
+    try:
+        r = requests.get(f"{_CIR}/{urllib.parse.quote(ik)}/iupac_name",
+                         timeout=10, headers=_HEADERS)
+        if r.ok and r.text.strip():
+            return r.text.strip().split("\n")[0][:80]
+    except Exception:
+        pass
+    return None
+
 
 def pubchem_by_name(name: str):
     """Name → CID first, then properties by CID. No @st.cache_data to avoid stale None."""
@@ -1127,18 +1170,32 @@ with st.sidebar:
 
     st.markdown("**Search by name**")
     name_q = st.text_input("", placeholder="ibuprofen, aspirin…", label_visibility="collapsed")
-    if st.button("Look up on PubChem", use_container_width=True):
+    if st.button("🔍 Search by name", use_container_width=True):
         if name_q.strip():
             if _allowed("sidebar"):
+                found = False
+                # ── Method A: PubChem ───────────────────────────────────────
                 with st.spinner("Querying PubChem…"):
                     pc_res = pubchem_lookup(smiles="", name=name_q.strip())
                 if pc_res:
-                    st.session_state.smiles_override = (pc_res.get("IsomericSMILES")
-                                                        or pc_res.get("CanonicalSMILES",""))
-                    st.session_state.lookup_name     = pc_res.get("IUPACName", name_q)
-                    st.success(f"Found CID {pc_res.get('CID')}")
-                else:
-                    st.error("Not found. Try a common name (e.g. 'aspirin', 'ibuprofen').")
+                    smi = pc_res.get("IsomericSMILES") or pc_res.get("CanonicalSMILES","")
+                    if smi:
+                        st.session_state.smiles_override = smi
+                        st.session_state.lookup_name     = pc_res.get("IUPACName", name_q)
+                        st.success(f"✅ Found on PubChem · CID {pc_res.get('CID')}")
+                        found = True
+                # ── Method B: NIH CIR (Chemical Identifier Resolver) ────────
+                if not found:
+                    with st.spinner("Trying NIH Chemical Resolver…"):
+                        cir_smi = cir_smiles_from_name(name_q.strip())
+                    if cir_smi:
+                        st.session_state.smiles_override = cir_smi
+                        st.session_state.lookup_name     = name_q.strip().title()
+                        st.success(f"✅ Found via NIH CIR")
+                        found = True
+                if not found:
+                    st.error("❌ Not found on PubChem or NIH CIR. "
+                             "Check spelling or try the IUPAC name.")
             else:
                 st.warning("Rate limit reached. Wait 60 s.")
 
@@ -1230,7 +1287,20 @@ if st.session_state.lookup_name:
 elif not is_hdr and chosen in EXAMPLES:
     compound_name = chosen
 else:
-    compound_name = SMILES_TO_NAME.get(smiles_input.strip(), "Custom Compound")
+    compound_name = SMILES_TO_NAME.get(smiles_input.strip(), "")
+
+# Auto-name unknown SMILES via NIH CIR (cached per session, non-blocking)
+if not compound_name:
+    _cache_key = f"_cir_name_{smiles_input.strip()}"
+    if _cache_key not in st.session_state:
+        # Try InChIKey first (more reliable), then SMILES
+        _auto = None
+        if mol_inchikey:
+            _auto = cir_iupac_from_inchikey(mol_inchikey)
+        if not _auto:
+            _auto = cir_iupac_from_smiles(smiles_input.strip())
+        st.session_state[_cache_key] = _auto or ""
+    compound_name = st.session_state[_cache_key] or "Custom Compound"
 
 hist_entry = {"name": compound_name, "smiles": smiles_input.strip(),
               "qed": data["drug_likeness"]["qed"], "mw": data["molecular_weight"]}
@@ -2027,14 +2097,24 @@ with tab_db:
                     st.markdown("**Synonyms / trade names:**")
                     for s in syns[:6]: st.markdown(f"  - {s}")
         else:
-            st.warning("⚠️ PubChem API did not return data after 5 lookup methods.")
+            st.warning("⚠️ PubChem API unavailable — showing data from NIH CIR & RDKit instead.")
 
-            if mol_inchikey:
-                st.markdown(
-                    f"**Open on PubChem directly** (InChIKey from RDKit):  \n"
-                    f"[🔗 pubchem.ncbi.nlm.nih.gov/compound/{mol_inchikey}]"
-                    f"(https://pubchem.ncbi.nlm.nih.gov/compound/{mol_inchikey})"
-                )
+            # ── CIR fallback: IUPAC name + formula from local RDKit ──────────
+            _cir_name = cir_iupac_from_inchikey(mol_inchikey) if mol_inchikey else None
+            if not _cir_name:
+                _cir_name = cir_iupac_from_smiles(smiles_input.strip())
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**IUPAC name (NIH CIR):** {_cir_name or '—'}")
+                st.markdown(f"**InChIKey (RDKit):** `{mol_inchikey or '—'}`")
+                st.markdown(f"**Formula (RDKit):** {data.get('formula') or rdMolDescriptors.CalcMolFormula(mol)}")
+                st.markdown(f"**MW (RDKit):** {data['molecular_weight']} Da")
+            with c2:
+                if mol_inchikey:
+                    st.markdown(
+                        f"[🔗 View on PubChem](https://pubchem.ncbi.nlm.nih.gov/compound/{mol_inchikey})  \n"
+                        f"[🔗 View on ChemSpider](https://www.chemspider.com/InChIKey/{mol_inchikey})"
+                    )
 
             with st.expander("🔍 Diagnostic — exact errors per method"):
                 st.markdown(f"**InChIKey (RDKit):** `{mol_inchikey or 'unavailable'}`")
